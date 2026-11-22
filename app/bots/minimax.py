@@ -101,6 +101,36 @@ class _TimeUp(Exception):
     """Levee pour interrompre la recherche des que le budget est epuise."""
 
 
+@dataclass(frozen=True)
+class SearchInfo:
+    """Bilan d'une iteration terminee de l'approfondissement iteratif."""
+
+    depth: int
+    #: Score en centipions, du point de vue du camp au trait a la racine.
+    score: int
+    #: Noeuds cumules depuis le debut de la recherche, toutes iterations.
+    nodes: int
+    #: Temps ecoule depuis le debut de la recherche, en secondes.
+    elapsed: float
+    #: Variante principale, a partir du coup a jouer.
+    pv: tuple[chess.Move, ...]
+
+
+@dataclass(frozen=True)
+class SearchReport:
+    """Bilan d'un coup : le coup choisi et ce que sa recherche a coute."""
+
+    move: chess.Move | None
+    #: Temps accorde a la recherche, en secondes (0 si le coup etait force).
+    budget: float
+    #: Temps reellement passe a chercher, en secondes.
+    elapsed: float
+    #: Derniere profondeur entierement terminee (0 si aucune recherche).
+    depth: int
+    nodes: int
+    score: int
+
+
 class _Search:
     """Etat d'une recherche. Instancie a chaque coup : aucun etat n'est partage
     entre deux recherches, ce qui rend le bot utilisable depuis plusieurs
@@ -114,12 +144,15 @@ class _Search:
         max_depth: int,
         use_quiescence: bool = True,
         evaluate_fn: Callable[[chess.Board], int] = evaluate,
+        on_iteration: Callable[[SearchInfo], None] | None = None,
     ) -> None:
         self.board = board
         self.deadline = deadline
         self.max_depth = max_depth
         self.use_quiescence = use_quiescence
         self.evaluate_fn = evaluate_fn
+        self.on_iteration = on_iteration
+        self.started = time.monotonic()
 
         self.tt: dict[object, tuple[int, int, int, chess.Move | None]] = {}
         # Les extensions d'echec font grimper `ply` au-dela de `max_depth` :
@@ -156,6 +189,16 @@ class _Search:
             best_move = move
             self.score = score
             self.depth_reached = depth
+            if self.on_iteration is not None and move is not None:
+                self.on_iteration(
+                    SearchInfo(
+                        depth=depth,
+                        score=score,
+                        nodes=self.nodes,
+                        elapsed=time.monotonic() - self.started,
+                        pv=self._principal_variation(move, depth),
+                    )
+                )
 
             # Mat trouve : creuser davantage ne changera rien.
             if abs(score) > MATE_THRESHOLD:
@@ -404,6 +447,33 @@ class _Search:
 
     # ------------------------------------------------------------- outillage
 
+    def _principal_variation(
+        self, first_move: chess.Move, max_length: int
+    ) -> tuple[chess.Move, ...]:
+        """Variante principale, reconstruite en suivant les meilleurs coups de
+        la table de transposition.
+
+        La racine n'est pas stockee dans la table, d'ou le premier coup passe en
+        argument. Une autre branche a pu ecraser une entree : on s'arrete au
+        premier coup absent ou illegal, la variante est donc parfois plus courte
+        que la profondeur.
+        """
+        board = self.board
+        pv: list[chess.Move] = []
+        move: chess.Move | None = first_move
+        try:
+            while move is not None and len(pv) < max_length:
+                board.push(move)
+                pv.append(move)
+                entry = self.tt.get(_transposition_key(board))
+                move = entry[3] if entry is not None else None
+                if move is not None and not board.is_legal(move):
+                    move = None
+        finally:
+            for _ in pv:
+                board.pop()
+        return tuple(pv)
+
     def _move_score(self, move: chess.Move, tt_move: chess.Move | None, ply: int) -> int:
         if tt_move is not None and move == tt_move:
             return _TT_MOVE_SCORE
@@ -513,11 +583,27 @@ class MinimaxBot:
         ms_left: int | None = None,
         increment_ms: int = 0,
     ) -> chess.Move | None:
+        return self.search(board, ms_left, increment_ms).move
+
+    def search(
+        self,
+        board: chess.Board,
+        ms_left: int | None = None,
+        increment_ms: int = 0,
+        on_iteration: Callable[[SearchInfo], None] | None = None,
+    ) -> SearchReport:
+        """Comme `choose_move`, mais renvoie aussi le cout de la recherche.
+
+        `on_iteration` est appele apres chaque profondeur terminee : le pont
+        UCI s'en sert pour envoyer ses lignes `info` au fil de la recherche.
+        """
         legal_moves = list(board.legal_moves)
         if not legal_moves:
-            return None
+            return SearchReport(None, budget=0.0, elapsed=0.0, depth=0, nodes=0, score=0)
         if len(legal_moves) == 1:
-            return legal_moves[0]
+            return SearchReport(
+                legal_moves[0], budget=0.0, elapsed=0.0, depth=0, nodes=0, score=0
+            )
 
         budget = self.time_budget
         if ms_left is not None:
@@ -537,5 +623,14 @@ class MinimaxBot:
             max_depth=self.max_depth,
             use_quiescence=self.use_quiescence,
             evaluate_fn=self.evaluate_fn,
+            on_iteration=on_iteration,
         )
-        return search.run() or legal_moves[0]
+        move = search.run() or legal_moves[0]
+        return SearchReport(
+            move,
+            budget=budget,
+            elapsed=time.monotonic() - search.started,
+            depth=search.depth_reached,
+            nodes=search.nodes,
+            score=search.score,
+        )

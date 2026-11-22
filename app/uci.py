@@ -5,6 +5,12 @@ script importe directement `MinimaxBot` et traduit les commandes UCI
 (`position`, `go`, ...) en appels a `choose_move(board, ms_left)`, sans
 dependance reseau.
 
+Pendant la recherche, une ligne `info depth ... score ... pv ...` est envoyee
+apres chaque profondeur terminee. Apres chaque coup, une ligne de journal part
+sur stderr : pendule, budget, temps reellement passe, profondeur, noeuds/s,
+attente de l'arret de la chauffe, et un drapeau DEPASSEMENT si la recherche a
+deborde son budget.
+
 Lancement : `python app/uci.py` depuis la racine du projet (ou en donnant ce
 chemin comme `EngineDir`/executable a lichess-bot).
 """
@@ -21,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chess
 
-from app.bots.minimax import MinimaxBot
+from app.bots.minimax import MATE_SCORE, MATE_THRESHOLD, MinimaxBot, SearchInfo, SearchReport
 
 ENGINE_NAME = "ChessbotMinimax"
 ENGINE_AUTHOR = "Montaigne"
@@ -100,6 +106,67 @@ def send(msg: str) -> None:
     print(msg, flush=True)
 
 
+def log(msg: str) -> None:
+    """Journal pour l'humain, sur stderr : stdout est reserve au protocole UCI.
+    lichess-bot laisse passer stderr (`silence_stderr: false`)."""
+    print(f"[chessbot] {msg}", file=sys.stderr, flush=True)
+
+
+def _uci_score(score: int) -> str:
+    """Score au format UCI : `cp N`, ou `mate N` en coups (negatif si c'est
+    le moteur qui se fait mater)."""
+    if score > MATE_THRESHOLD:
+        return f"mate {(MATE_SCORE - score + 1) // 2}"
+    if score < -MATE_THRESHOLD:
+        return f"mate {-((MATE_SCORE + score) // 2)}"
+    return f"cp {score}"
+
+
+def send_info(info: SearchInfo) -> None:
+    """Ligne `info` envoyee apres chaque profondeur terminee."""
+    elapsed_ms = max(int(info.elapsed * 1000), 1)
+    nps = info.nodes * 1000 // elapsed_ms
+    pv = " ".join(move.uci() for move in info.pv)
+    send(
+        f"info depth {info.depth} score {_uci_score(info.score)} nodes {info.nodes} "
+        f"nps {nps} time {elapsed_ms} pv {pv}"
+    )
+
+
+def log_move(
+    move_board: chess.Board,
+    report: SearchReport,
+    clock: str,
+    warmup_wait: float,
+    total: float,
+) -> None:
+    """Une ligne par coup : ou est passe le temps, et a quelle profondeur."""
+    number = f"{move_board.fullmove_number}{'.' if move_board.turn == chess.WHITE else '...'}"
+    played = report.move.uci() if report.move is not None else "0000"
+    parts = [f"coup {number} {played}", clock]
+    if report.move is None:
+        parts.append("aucun coup legal")
+    elif report.budget == 0:
+        parts.append("coup force, sans recherche")
+    else:
+        # Sous Windows l'horloge a une resolution d'environ 15 ms : un coup
+        # instantane affiche 0 s, sans vitesse calculable.
+        speed = f", {int(report.nodes / report.elapsed)} n/s" if report.elapsed > 0 else ""
+        parts += [
+            f"budget {report.budget:.2f}s",
+            f"recherche {report.elapsed:.2f}s",
+            f"profondeur {report.depth}",
+            f"{report.nodes} noeuds{speed}",
+            f"score {_uci_score(report.score)}",
+        ]
+    parts.append(f"chauffe {warmup_wait:.2f}s, total {total:.2f}s")
+    # Au-dela de 50 ms, ce n'est plus la granularite de la verification de
+    # l'heure : le signaler pour reperer les coups qui debordent.
+    if report.budget > 0 and report.elapsed > report.budget + 0.05:
+        parts.append(f"DEPASSEMENT +{report.elapsed - report.budget:.2f}s")
+    log(" | ".join(parts))
+
+
 def handle_position(tokens: list[str]) -> None:
     global board
     if not tokens:
@@ -122,6 +189,7 @@ def handle_position(tokens: list[str]) -> None:
 
 
 def handle_go(tokens: list[str]) -> None:
+    received = time.monotonic()
     params: dict[str, int] = {}
     i = 0
     while i < len(tokens):
@@ -140,14 +208,23 @@ def handle_go(tokens: list[str]) -> None:
         scale = round(1 / ENGINE.clock_fraction)
         ms_left = params["movetime"] * scale
         increment = 0
+        clock = f"movetime {params['movetime'] / 1000:.2f}s"
     else:
         is_white = board.turn == chess.WHITE
         ms_left = params.get("wtime" if is_white else "btime")
         increment = params.get("winc" if is_white else "binc", 0)
+        clock = (
+            f"pendule {ms_left / 1000:.1f}s +{increment / 1000:.1f}s"
+            if ms_left is not None
+            else "pendule inconnue"
+        )
 
     WARMUP.stop()
-    move = ENGINE.choose_move(board, ms_left=ms_left, increment_ms=increment)
+    warmup_wait = time.monotonic() - received
+    report = ENGINE.search(board, ms_left=ms_left, increment_ms=increment, on_iteration=send_info)
+    move = report.move
     send(f"bestmove {move.uci() if move is not None else '0000'}")
+    log_move(board, report, clock, warmup_wait, time.monotonic() - received)
     # Le moteur redevient inactif jusqu'au prochain `go` : on reprend la chauffe.
     WARMUP.start()
 

@@ -45,6 +45,8 @@ python -m tools.arena --bot-a random --bot-b normal --games 10
 
 `app/uci.py` est un pont UCI : il lit les commandes sur stdin, appelle `MinimaxBot` directement (sans HTTP) et répond sur stdout. `lichess-bot-service/` l'empaquette avec une version épinglée de lichess-bot.
 
+Pendant la recherche, le moteur envoie une ligne `info` UCI par profondeur terminée (profondeur, score, nœuds, nœuds/s, variante principale). Après chaque coup, il écrit sur stderr une ligne préfixée `[chessbot]` : pendule, budget, temps réellement passé, profondeur, nœuds/s, attente de l'arrêt de la chauffe. Un drapeau `DEPASSEMENT` apparaît quand la recherche dépasse son budget de plus de 50 ms.
+
 ```bash
 # .env à la racine (ignoré par git) :
 #   LICHESS_BOT_TOKEN=<jeton API d'un compte Lichess converti en bot>
