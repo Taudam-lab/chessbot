@@ -9,7 +9,7 @@ Pendant la recherche, une ligne `info depth ... score ... pv ...` est envoyee
 apres chaque profondeur terminee. Apres chaque coup, une ligne de journal part
 sur stderr : pendule, budget, temps reellement passe, profondeur, noeuds/s,
 attente de l'arret de la chauffe, et un drapeau DEPASSEMENT si la recherche a
-deborde son budget.
+deborde sa limite dure.
 
 Lancement : `python app/uci.py` depuis la racine du projet (ou en donnant ce
 chemin comme `EngineDir`/executable a lichess-bot).
@@ -152,18 +152,22 @@ def log_move(
         # Sous Windows l'horloge a une resolution d'environ 15 ms : un coup
         # instantane affiche 0 s, sans vitesse calculable.
         speed = f", {int(report.nodes / report.elapsed)} n/s" if report.elapsed > 0 else ""
+        budget = f"budget {report.budget:.2f}s (max {report.hard_limit:.2f}s)"
+        if report.extension > 1:
+            budget += f", prolonge x{report.extension:.2f}"
         parts += [
-            f"budget {report.budget:.2f}s",
+            budget,
             f"recherche {report.elapsed:.2f}s",
             f"profondeur {report.depth}",
             f"{report.nodes} noeuds{speed}",
             f"score {_uci_score(report.score)}",
         ]
     parts.append(f"chauffe {warmup_wait:.2f}s, total {total:.2f}s")
-    # Au-dela de 50 ms, ce n'est plus la granularite de la verification de
-    # l'heure : le signaler pour reperer les coups qui debordent.
-    if report.budget > 0 and report.elapsed > report.budget + 0.05:
-        parts.append(f"DEPASSEMENT +{report.elapsed - report.budget:.2f}s")
+    # Depasser la limite souple est normal (derniere profondeur lancee, ou
+    # prolongation). Depasser la dure de plus de 50 ms ne l'est pas : ce n'est
+    # plus la granularite de la verification de l'heure.
+    if report.budget > 0 and report.elapsed > report.hard_limit + 0.05:
+        parts.append(f"DEPASSEMENT +{report.elapsed - report.hard_limit:.2f}s")
     log(" | ".join(parts))
 
 
@@ -201,14 +205,11 @@ def handle_go(tokens: list[str]) -> None:
                 continue
         i += 1
 
-    # MinimaxBot ne raisonne qu'en fraction du temps restant (clock_fraction) :
-    # pour un `movetime` fixe, on gonfle ms_left par l'inverse de cette
-    # fraction pour que le budget resultant retombe exactement sur movetime.
-    if "movetime" in params:
-        scale = round(1 / ENGINE.clock_fraction)
-        ms_left = params["movetime"] * scale
+    movetime = params.get("movetime")
+    if movetime is not None:
+        ms_left = None
         increment = 0
-        clock = f"movetime {params['movetime'] / 1000:.2f}s"
+        clock = f"movetime {movetime / 1000:.2f}s"
     else:
         is_white = board.turn == chess.WHITE
         ms_left = params.get("wtime" if is_white else "btime")
@@ -221,7 +222,13 @@ def handle_go(tokens: list[str]) -> None:
 
     WARMUP.stop()
     warmup_wait = time.monotonic() - received
-    report = ENGINE.search(board, ms_left=ms_left, increment_ms=increment, on_iteration=send_info)
+    report = ENGINE.search(
+        board,
+        ms_left=ms_left,
+        increment_ms=increment,
+        on_iteration=send_info,
+        movetime_ms=movetime,
+    )
     move = report.move
     send(f"bestmove {move.uci() if move is not None else '0000'}")
     log_move(board, report, clock, warmup_wait, time.monotonic() - received)

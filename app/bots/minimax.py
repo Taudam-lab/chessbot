@@ -7,6 +7,9 @@ Les briques, dans l'ordre de rentabilite :
   (l'arbre croit geometriquement) et cela donne deux choses gratuitement : un
   coup jouable a tout instant, et un excellent ordre de coups pour l'iteration
   suivante.
+- **Gestion du temps a deux limites** : une limite souple decide si l'on
+  entame une profondeur de plus, une limite dure coupe la recherche net. La
+  souple est prolongee quand le meilleur coup change ou que le score chute.
 - **Tri des coups** : l'alpha-beta ne coupe que si les bons coups arrivent en
   premier. Coup de la table de transposition, puis captures (MVV-LVA), puis
   killers, puis heuristique d'historique.
@@ -76,6 +79,29 @@ _MVV_LVA = {
 #: marge contre la latence reseau.
 _INCREMENT_SHARE = 0.8
 
+# Gestion du temps a deux limites. La limite souple decide s'il vaut la peine
+# d'entamer une nouvelle profondeur ; la limite dure coupe la recherche net.
+# La dure laisse a la derniere iteration lancee le temps de se terminer (une
+# profondeur coute 2 a 4 fois la precedente) et de prolonger les positions
+# instables, sans jamais devenir un risque pour la pendule.
+_HARD_LIMIT_FACTOR = 4.0
+#: Cout estime d'une profondeur, en multiple de la precedente (facteur de
+#: branchement effectif mesure : 2 a 4). Sert a ne pas entamer une profondeur
+#: que la limite dure couperait de toute facon.
+_NEXT_DEPTH_COST = 3.0
+
+# Prolongation quand la recherche est instable : la limite souple est
+# multipliee par un facteur, borne par _MAX_EXTENSION puis par la limite dure.
+#: Poids d'un changement de meilleur coup. Le compteur est divise par deux a
+#: chaque profondeur, donc seuls les changements recents pesent.
+_BEST_MOVE_CHANGE_WEIGHT = 0.5
+#: Ecart de score entre deux profondeurs ignore : le score oscille
+#: naturellement entre profondeurs paires et impaires.
+_SCORE_DROP_MARGIN = 25
+#: Chute (au-dela de la marge) qui double le temps accorde, en centipions.
+_SCORE_DROP_SCALE = 100
+_MAX_EXTENSION = 2.5
+
 #: Marge de delta pruning : en quiescence, on ignore une capture qui, meme en
 #: gagnant la piece prise, ne peut pas remonter jusqu'a alpha.
 _DELTA_MARGIN = 200
@@ -101,6 +127,20 @@ class _TimeUp(Exception):
     """Levee pour interrompre la recherche des que le budget est epuise."""
 
 
+def _extension(best_move_changes: float, previous_score: int, score: int) -> float:
+    """Facteur applique a la limite souple selon l'instabilite de la recherche.
+
+    Deux signaux : le meilleur coup change d'une profondeur a l'autre (le
+    moteur hesite encore), ou le score chute (il vient de decouvrir une
+    menace). Dans les deux cas une profondeur de plus peut changer le coup
+    joue : c'est la que le temps rapporte le plus.
+    """
+    instability = 1 + _BEST_MOVE_CHANGE_WEIGHT * best_move_changes
+    drop = previous_score - score - _SCORE_DROP_MARGIN
+    falling = 1 + max(drop, 0) / _SCORE_DROP_SCALE
+    return min(instability * falling, _MAX_EXTENSION)
+
+
 @dataclass(frozen=True)
 class SearchInfo:
     """Bilan d'une iteration terminee de l'approfondissement iteratif."""
@@ -121,7 +161,8 @@ class SearchReport:
     """Bilan d'un coup : le coup choisi et ce que sa recherche a coute."""
 
     move: chess.Move | None
-    #: Temps accorde a la recherche, en secondes (0 si le coup etait force).
+    #: Limite souple : temps prevu pour le coup, en secondes (0 si le coup
+    #: etait force). Une recherche instable peut aller au-dela.
     budget: float
     #: Temps reellement passe a chercher, en secondes.
     elapsed: float
@@ -129,6 +170,11 @@ class SearchReport:
     depth: int
     nodes: int
     score: int
+    #: Limite dure : la recherche est coupee net au-dela, en secondes.
+    hard_limit: float = 0.0
+    #: Facteur applique a la limite souple a la derniere profondeur terminee
+    #: (1 si la recherche etait stable).
+    extension: float = 1.0
 
 
 class _Search:
@@ -145,9 +191,15 @@ class _Search:
         use_quiescence: bool = True,
         evaluate_fn: Callable[[chess.Board], int] = evaluate,
         on_iteration: Callable[[SearchInfo], None] | None = None,
+        soft_deadline: float | None = None,
     ) -> None:
+        """`deadline` est la limite dure (coupure en pleine recherche) ;
+        `soft_deadline`, la limite souple (plus de nouvelle profondeur au-dela).
+        Sans limite souple, les deux se confondent, comme avant leur separation.
+        """
         self.board = board
         self.deadline = deadline
+        self.soft_deadline = deadline if soft_deadline is None else min(soft_deadline, deadline)
         self.max_depth = max_depth
         self.use_quiescence = use_quiescence
         self.evaluate_fn = evaluate_fn
@@ -165,6 +217,7 @@ class _Search:
         self.nodes = 0
         self.depth_reached = 0
         self.score = 0
+        self.extension = 1.0
         #: Meilleur coup de l'iteration en cours, mis a jour au fil de l'eau
         #: pour etre exploitable si le temps tombe en plein milieu.
         self._partial_best: chess.Move | None = None
@@ -173,8 +226,11 @@ class _Search:
 
     def run(self) -> chess.Move | None:
         best_move: chess.Move | None = None
+        soft_span = self.soft_deadline - self.started
+        best_move_changes = 0.0
 
         for depth in range(1, self.max_depth + 1):
+            iteration_started = time.monotonic()
             self._partial_best = None
             try:
                 move, score = self._search_root(depth, best_move)
@@ -186,6 +242,7 @@ class _Search:
                     best_move = self._partial_best
                 break
 
+            previous_move, previous_score = best_move, self.score
             best_move = move
             self.score = score
             self.depth_reached = depth
@@ -203,9 +260,23 @@ class _Search:
             # Mat trouve : creuser davantage ne changera rien.
             if abs(score) > MATE_THRESHOLD:
                 break
-            # Inutile d'entamer une profondeur qu'on ne finira pas.
-            if time.monotonic() >= self.deadline:
+
+            if depth > 1:
+                best_move_changes = best_move_changes / 2 + (move != previous_move)
+                self.extension = _extension(best_move_changes, previous_score, score)
+            # Limite souple, prolongee si la recherche est instable : au-dela,
+            # la profondeur suivante a peu de chances d'aboutir avant la
+            # limite dure.
+            now = time.monotonic()
+            if now >= min(self.started + soft_span * self.extension, self.deadline):
                 break
+            # Meme avant la limite souple, une profondeur que la limite dure
+            # couperait presque surement brulerait du temps pour rien. Sans
+            # limite souple distincte (budget fixe), on garde l'ancien
+            # comportement : chercher jusqu'a la coupure.
+            if self.soft_deadline < self.deadline:
+                if now + (now - iteration_started) * _NEXT_DEPTH_COST > self.deadline:
+                    break
 
         return best_move
 
@@ -591,11 +662,13 @@ class MinimaxBot:
         ms_left: int | None = None,
         increment_ms: int = 0,
         on_iteration: Callable[[SearchInfo], None] | None = None,
+        movetime_ms: int | None = None,
     ) -> SearchReport:
         """Comme `choose_move`, mais renvoie aussi le cout de la recherche.
 
         `on_iteration` est appele apres chaque profondeur terminee : le pont
         UCI s'en sert pour envoyer ses lignes `info` au fil de la recherche.
+        `movetime_ms` impose un temps fixe pour ce coup et prime sur `ms_left`.
         """
         legal_moves = list(board.legal_moves)
         if not legal_moves:
@@ -605,21 +678,28 @@ class MinimaxBot:
                 legal_moves[0], budget=0.0, elapsed=0.0, depth=0, nodes=0, score=0
             )
 
-        budget = self.time_budget
-        if ms_left is not None:
+        # Sans pendule (ou avec un temps impose par coup), limites souple et
+        # dure se confondent : le bot pense exactement le temps prevu.
+        soft = hard = self.time_budget
+        if movetime_ms is not None:
+            soft = hard = min(self.time_budget, movetime_ms / 1000)
+        elif ms_left is not None:
             remaining = ms_left / 1000
             # Une fraction du temps restant, plus l'essentiel de l'increment :
             # il est rendu apres le coup, donc le depenser ne coute rien.
             spend = remaining * self.clock_fraction + _INCREMENT_SHARE * increment_ms / 1000
             # Jamais plus de la moitie du temps restant : en fin de blitz le bot
             # accelere au lieu de tomber au drapeau, meme avec un gros increment.
-            budget = min(budget, max(min(spend, remaining / 2), 0.05))
+            hard = min(hard, max(min(spend * _HARD_LIMIT_FACTOR, remaining / 2), 0.05))
+            soft = min(max(spend, 0.05), hard)
 
         # La recherche travaille sur une copie : elle abandonne l'arbre en cours
         # sur _TimeUp sans depiler, et le plateau de l'appelant reste intact.
+        now = time.monotonic()
         search = _Search(
             board.copy(),
-            deadline=time.monotonic() + budget,
+            deadline=now + hard,
+            soft_deadline=now + soft,
             max_depth=self.max_depth,
             use_quiescence=self.use_quiescence,
             evaluate_fn=self.evaluate_fn,
@@ -628,9 +708,11 @@ class MinimaxBot:
         move = search.run() or legal_moves[0]
         return SearchReport(
             move,
-            budget=budget,
+            budget=soft,
             elapsed=time.monotonic() - search.started,
             depth=search.depth_reached,
             nodes=search.nodes,
             score=search.score,
+            hard_limit=hard,
+            extension=search.extension,
         )
