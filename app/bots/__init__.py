@@ -23,6 +23,11 @@ _REGISTRY: dict[str, Bot] = {
         ),
         MinimaxBot(name="normal", label="Minimax - Normal", time_budget=0.60),
         MinimaxBot(name="hard", label="Minimax - Difficile", time_budget=1.50),
+        # Le moteur deploye sur Lichess (app/uci.py le recupere ici) : l'arene
+        # teste ainsi exactement la configuration en production. Plafond
+        # large, c'est la pendule qui limite : a jouer avec `--tc` dans
+        # l'arene, sinon il reflechit 120 s par coup.
+        MinimaxBot(name="lichess", label="Minimax - Lichess", time_budget=120.0),
     )
 }
 

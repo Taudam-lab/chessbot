@@ -29,6 +29,7 @@ L'évaluation est isolée de la recherche : `MinimaxBot.evaluate_fn` est injecta
 | `easy` | profondeur 2, sans quiescence (gaffe comme un débutant) |
 | `normal` (défaut) | budget de 0,6 s par coup |
 | `hard` | budget de 1,5 s par coup |
+| `lichess` | le moteur déployé (`app/uci.py` le prend dans le registre) : plafond de 120 s, c'est la pendule qui limite, donc à utiliser avec `--tc` dans l'arène |
 
 Chaque bot adapte son temps de réflexion au temps restant sur la pendule (`clock_fraction` : une fraction du temps restant par coup), pour ne pas tomber au drapeau.
 
@@ -68,7 +69,7 @@ Tous se lancent depuis la racine du projet avec `python -m tools.<nom>`.
 
 | Outil | Rôle |
 |---|---|
-| `arena` | fait jouer deux bots du registre l'un contre l'autre et affiche le score (`--bot-a random --bot-b normal --games 10`) |
+| `arena` | fait jouer deux bots du registre l'un contre l'autre et affiche le score, l'écart Elo avec sa marge à 95 % et la probabilité que A soit plus fort (`--bot-a random --bot-b normal --games 10`). Options : `--tc 60+1` (pendule par camp, défaites au temps comprises), `--openings` (paires de parties partant des lignes du livre, couleurs inversées), `--workers N` (parties en parallèle) |
 | `lichess_stats` | performances réelles sur Lichess, par version du moteur |
 | `prepare_eval_dataset` | extrait un échantillon du dump Lichess d'évaluations Stockfish |
 | `train_baseline_eval` | baselines de comparaison : moyenne, régression sur le matériel, `evaluate()` actuel |

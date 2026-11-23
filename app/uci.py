@@ -27,15 +27,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chess
 
+from app.bots import get_bot
 from app.bots.minimax import MATE_SCORE, MATE_THRESHOLD, MinimaxBot, SearchInfo, SearchReport
 
 ENGINE_NAME = "ChessbotMinimax"
 ENGINE_AUTHOR = "Montaigne"
 
-# Plafond de temps large : la vraie limite vient de wtime/btime traduits en
-# ms_left, ce time_budget ne doit pas etre la contrainte active sur les
-# cadences lentes (rapid/classical).
-ENGINE = MinimaxBot(name="uci", label="UCI", time_budget=120.0)
+# Configuration definie dans le registre (bot `lichess`), pour que l'arene
+# teste exactement le moteur deploye. Son plafond de temps est large : la vraie
+# limite vient de wtime/btime traduits en ms_left, et ce plafond ne doit pas
+# etre la contrainte active sur les cadences lentes (rapid/classical).
+ENGINE = get_bot("lichess")
+assert isinstance(ENGINE, MinimaxBot)
 
 board = chess.Board()
 
